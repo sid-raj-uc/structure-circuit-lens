@@ -1,0 +1,11 @@
+Notes for the report
+These are decision points and observations we're flagging now and will discuss in the writeup. I'll keep adding to this list as we hit more.
+1. PC conditioning depth cap (decided ~2.5 weeks in).
+We ran PC + Fisher-Z without a depth cap and it failed to terminate within 12 minutes on 76 variables × 5000 samples. We capped depth at 2 (or 3, depending on what we settle on). Two reasons:
+
+Statistical power. With binary-ish sparse data, conditioning sets larger than 2–3 create strata so sparse that the CI test has no data per stratum. The test returns noise rather than signal.
+Combinatorial cost. At depth d, each edge requires C(k, d) CI tests where k is the local neighborhood size. For k ≈ 20–30 (plausible given likely hub features in our data), depth ≥ 4 is intractable. Depth 2 keeps it tractable while capturing the dependencies that matter.
+
+This is a methodological choice, not a bug. The PC literature recommends capping depth for moderate-dimensional sparse data; we follow that. The tradeoff: we may miss some edges that would only have been removed by conditioning on larger sets. This is honestly noted as a limitation.
+2. Fisher-Z misspecification on SAE feature data.
+Fisher-Z assumes joint Gaussianity. SAE feature activations are zero-inflated, heavy-tailed, and non-negative — about as far from Gaussian as it gets. We run it anyway as a fast baseline, but the more honest comparison comes from running PC with the G-test on binarized data. The agreement (or disagreement) between Fisher-Z and G-test results is itself a finding — it quantifies how much the distributional assumption matters.
