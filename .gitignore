@@ -1,2 +1,43 @@
-data/
+# Python
 .venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Data — large files, downloaded locally
+data/
+*.npy
+*.npz
+*.pkl
+*.csv
+
+# Results — reproducible by running the notebooks
+results/
+
+# Presentation build artifacts
+pgm_final_presentation.pptx
+pgm.pptx
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# Scratch / draft notebooks
+3_impl.ipynb
+3_impl_new.ipynb
+test.ipynb

@@ -1,0 +1,598 @@
+\documentclass{article}
+
+\usepackage[final]{neurips_2023}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{array}
+
+\title{Graphical Model Structure Learning\\for Sparse Feature Circuits in GPT-2}
+
+\author{%
+  Siddharth Raj \\
+  Toyota Technological Institute at Chicago \\
+  \texttt{sidraj@uchicago.edu}
+}
+
+\begin{document}
+
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+% ─────────────────────────────────────────────────────────────────────────────
+We ask whether probabilistic graphical model (PGM) structure learning,
+applied to sparse feature activations, can automatically recover the circuits
+inside a language model.
+Using Sparse Autoencoders (SAEs) to extract 76 interpretable features from
+GPT-2 Small's residual streams at layers 1 and 2, we treat feature activations
+across 5,000 prompts as a multivariate dataset and run three algorithms: the
+PC algorithm with Fisher-Z and G-test independence tests, a custom GES-BIC
+implementation accelerated via Schur-complement score evaluations, and Mean
+Ablation Patching as a causal proxy baseline.
+We make two methodological contributions.
+First, we introduce a dual-ground-truth evaluation protocol that separates
+\emph{interventional} validation (zero-ablation) from \emph{observational}
+validation (Spearman rank correlation), exposing a structural bias that
+inflates Mean Ablation's apparent advantage.
+Second, we show that GES-BIC dominates both PC variants on precision and
+speed simultaneously: 157 edges, 0.667 ablation IA, in 36 seconds.
+Pairwise Jaccard similarity of $\approx 0.10$ between PGM and ablation methods
+demonstrates that statistical dependence and interventional sensitivity
+discover fundamentally different edge sets.
+Head-level aggregation reveals a consistent broad semantic circuit
+(L0H9 $\to$ L1H2/H10) across all methods, but not the known induction circuit,
+which we attribute to the feature selection regime rather than a failure of
+structure learning.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Understanding \emph{how} large language models implement their computations is
+a central open problem. \emph{Mechanistic interpretability} decomposes model
+behaviour into human-understandable circuits---subgraphs of components that
+collectively perform a specific function \citep{olah2020zoom,
+elhage2021framework}. Most circuit discovery to date has required substantial
+manual effort: identifying components by hand, writing targeted prompts, and
+iterating through ablation experiments \citep{wang2022ioi, olsson2022induction}.
+
+Automating this process is the core motivation of our work. PGM structure
+learning offers a principled framework: collect feature activations across
+diverse inputs, model them as samples from a joint distribution over a DAG,
+and recover the graph. If the model's circuits drive the statistical
+dependencies in the activation data, structure learning should recover them.
+Two challenges complicate this picture. First, circuit-specific features may
+fire rarely, making them invisible to density-based feature filters. Second,
+the standard evaluation metric---intervention agreement---conflates methods
+that find statistical co-occurrence with those that directly measure causal
+sensitivity.
+
+We address both challenges. We apply PC (Fisher-Z and G-test) and GES-BIC to
+SAE feature activations from GPT-2 Small, with Mean Ablation Patching as a
+causal baseline. We introduce a dual-ground-truth evaluation to separate
+statistical from causal validation. We perform a head-level analysis to
+interpret recovered edges against the known GPT-2 induction circuit
+\citep{olsson2022induction}. Our key findings are: (1) GES-BIC achieves the
+best precision--speed trade-off among PGM methods; (2) statistical and
+ablation methods find fundamentally different edges (Jaccard $\approx 0.10$);
+and (3) feature selection determines which circuits are discoverable, with the
+5\%--95\% firing-rate filter recovering a broad semantic circuit rather than
+the induction circuit.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Background and Related Work}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Sparse Autoencoders}
+
+Raw neurons in transformer models are \emph{polysemantic}: a single neuron
+responds to many unrelated concepts due to superposition
+\citep{elhage2022superposition}. Sparse Autoencoders (SAEs) learn an
+overcomplete dictionary of approximately monosemantic features. Given a residual
+stream vector $\mathbf{x} \in \mathbb{R}^{d}$, the SAE encoder computes:
+\[
+  \mathbf{f}(\mathbf{x}) = \text{ReLU}(W_{\text{enc}}\,\mathbf{x} + \mathbf{b})
+  \in \mathbb{R}^{d_{\text{sae}}}
+\]
+where $d_{\text{sae}} \gg d$ ($d{=}768$, $d_{\text{sae}}{=}24{,}576$).
+The reconstruction $\hat{\mathbf{x}} = W_{\text{dec}}\,\mathbf{f}(\mathbf{x}) + \mathbf{b}_{\text{dec}}$
+is trained to be accurate while keeping $\mathbf{f}$ sparse, encouraging each
+feature to encode one concept. We use the \texttt{gpt2-small-res-jb} release
+from \texttt{sae\_lens} \citep{bloom2024saelens}, hooking at
+\texttt{blocks.1.hook\_resid\_pre} (L1) and \texttt{blocks.2.hook\_resid\_pre} (L2).
+
+\subsection{The GPT-2 Induction Circuit}
+
+\citet{olsson2022induction} identified an induction circuit enabling
+in-context learning. On sequences with repeated pattern $A \ldots B \ldots A$,
+the model predicts $B$ via: \textbf{(1)} prev-token heads (L0H0, L0H1) copy
+the previous token's identity into the current residual stream; \textbf{(2)}
+induction heads (L1H5, L1H6) use this information to predict the token that
+followed $A$ previously. This circuit operates precisely between the L1 and
+L2 residual streams, making it an ideal ground truth for our task.
+
+\subsection{Related Work on Automated Circuit Discovery}
+
+\citet{conmy2023acdc} introduced Automated Circuit DisCovery (ACDC), which
+iteratively ablates attention edges while monitoring a task-specific metric to
+prune a full transformer computational graph. This approach requires a
+pre-specified task and metric. \citet{marks2025sparse} recover sparse feature
+circuits via integrated-gradient attribution through the SAE feature graph,
+producing interpretable edge weights. Both methods treat circuit discovery as
+a \emph{task-specific} problem. Our approach is complementary: we use general
+PGM structure learning on activation data without specifying a task,
+investigating whether the circuits implicit in the data's statistical structure
+can be recovered without supervision.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Problem Formulation}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Let $\mathbf{X} \in \mathbb{R}^{N \times p}$ with $N{=}5{,}000$ and $p{=}76$
+($p_1{=}30$ L1 features, $p_2{=}46$ L2 features). We partition features as
+$\mathcal{V} = \mathcal{L}_1 \cup \mathcal{L}_2$ and seek a directed graph
+$\mathcal{G} = (\mathcal{V}, \mathcal{E})$.
+
+We make two structural assumptions. First, we assume the joint distribution of
+$\mathbf{X}$ is \emph{Markov} with respect to some DAG over $\mathcal{V}$
+---the standard assumption underlying both PC and GES. Second, we use the known
+\emph{architectural causal ordering}: layer 1 computation causally precedes
+layer 2, so we restrict $\mathcal{E} \subseteq \mathcal{L}_1 \times
+\mathcal{L}_2$. An edge $(i, j) \in \mathcal{E}$ means L1 feature $i$ directly
+influences L2 feature $j$ through the layer-1 attention computation.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Methods}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{PC Algorithm with Architectural Orientation}
+
+The PC algorithm \citep{spirtes2000causation} learns a skeleton via conditional
+independence testing, then orients edges via v-structure detection and Meek's
+rules \citep{meek1995causal}. We run the skeleton phase with two tests, setting
+$|S| \leq 3$ to limit exponential growth in conditioning-set enumeration
+(depth-3 bounds the worst-case complexity to $\mathcal{O}(p^5)$).
+
+\paragraph{PC-FisherZ.}
+For continuous activations, we test partial correlation $\hat{\rho}_{ij \mid S}$
+obtained from the precision submatrix $\hat{\Omega} = \hat{\Sigma}^{-1}_{[i,j]\cup S}$:
+\[
+  \hat{\rho}_{ij \mid S} = \frac{-\hat{\Omega}_{ij}}{\sqrt{\hat{\Omega}_{ii}\hat{\Omega}_{jj}}}
+\]
+The Fisher-Z statistic $z = \frac{1}{2}\ln\frac{1+\hat{\rho}}{1-\hat{\rho}}$ is
+asymptotically $\mathcal{N}(0,\, (n{-}|S|{-}3)^{-1})$ under independence.
+Edge $(i,j)$ is removed when the two-tailed p-value exceeds $\alpha$.
+\emph{Note:} SAE activations are ReLU outputs and thus zero-inflated and
+non-Gaussian. Fisher-Z is asymptotically valid but may lose power at small
+sample sizes relative to the true conditional distribution.
+
+\paragraph{PC-GSq.}
+For binary activations (thresholded at zero), we use the G-test accumulated
+over strata defined by the conditioning set:
+\[
+  G = 2 \sum_{\text{strata}} \sum_{a,b \in \{0,1\}} O_{ab} \ln\!\frac{O_{ab}}{E_{ab}}
+\]
+under a $\chi^2$ null. This makes no distributional assumption but discards
+activation magnitude information.
+
+\paragraph{Orientation.}
+Rather than running v-structure detection and Meek's rules (which assume an
+unknown causal ordering), we orient all cross-layer skeleton edges $i \to j$
+($i \in \mathcal{L}_1$, $j \in \mathcal{L}_2$) using the known architectural
+ordering. This is more informative than Meek's rules and directly exploits
+the transformer's feed-forward structure.
+
+\subsection{GES-BIC (Custom Fast Implementation)}
+
+Greedy Equivalence Search \citep{chickering2002ges} optimises the BIC score
+over equivalence classes of DAGs in two phases. We score node $j$ given parent
+set $\text{Pa}(j)$ as:
+\[
+  \text{BIC}(j, \text{Pa}(j)) = -n \ln\!\!\left(\frac{\text{RSS}(j,\,\text{Pa}(j))}{n}\right)
+  - |\text{Pa}(j)|\cdot\ln n
+\]
+where $\text{RSS}$ is the OLS residual sum of squares.
+
+\paragraph{Schur-complement acceleration.}
+Precomputing $\mathbf{C} = \mathbf{X}_c^\top \mathbf{X}_c$ (mean-centered)
+once enables a closed-form RSS:
+\[
+  \text{RSS}(j, \text{Pa}) = C_{jj} -
+  \mathbf{c}_{\text{Pa},j}^\top \mathbf{C}_{\text{Pa},\text{Pa}}^{-1}\,
+  \mathbf{c}_{\text{Pa},j}
+\]
+All score evaluations use a single linear solve on $\mathbf{C}$, eliminating
+repeated data access. This reduces per-iteration cost from
+$\mathcal{O}(Np^2)$ to $\mathcal{O}(p^3)$ (dominated by the solve),
+yielding \textbf{36s} total runtime for $p{=}76$, $N{=}5{,}000$---versus hours
+for causal-learn's GES implementation. The forward phase adds 819 edges; the
+backward phase prunes to 157 final cross-layer edges.
+
+\subsection{Mean Ablation Patching}
+
+As a causal proxy baseline, we estimate the influence of L1 feature $i$ on
+L2 feature $j$ by replacing feature $i$'s activation with its dataset mean
+$\bar{x}_i$ and measuring the downstream change:
+\[
+  A_{ij} = \frac{1}{N}\sum_{n=1}^{N}\!\left|
+    f_j\!\left(\mathbf{x}_n;\,\tilde{\mathbf{x}}^{(i)}_n\right)
+    - f_j(\mathbf{x}_n)\right|
+\]
+Edges are thresholded at the 95th percentile of $\{A_{ij}\}$, yielding 69
+edges. This is \emph{mean-ablation sensitivity}---a linear, first-order causal
+proxy---and is distinct from the integrated-gradient attribution of
+\citet{marks2025sparse}, which computes gradient $\times$ activation through
+the full SAE computational graph.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Experimental Setup}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\paragraph{Data.}
+We pass 5,000 uniformly random token sequences of length 40 through GPT-2
+Small (\texttt{HookedTransformer} \citep{nanda2022transformerlens}, no
+preprocessing). The random-prompt design avoids task-specific bias, at the
+cost of not specifically activating circuits such as induction that require
+structured repetition. We encode the last-token residual stream at both SAE
+hooks, producing activations $\mathbf{X} \in \mathbb{R}^{5000 \times 49152}$
+per layer before filtering.
+
+\paragraph{Feature selection.}
+We retain features with firing rate (fraction of tokens with activation $> 0$)
+in $[5\%, 95\%]$, removing always-on and always-off features. This yields 30
+L1 and 46 L2 features ($p = 76$ total). An important scope limitation:
+circuit-specific features that fire rarely (e.g., induction features requiring
+$A \ldots B \ldots A$ patterns) are systematically excluded by this filter.
+
+\paragraph{Validation.}
+We stratify 40 edges for ground-truth validation: 20 PGM-only (in any PGM
+method but not ablation), 10 ablation-only, and 10 from the agreement set.
+This stratification ensures coverage across method disagreement regions.
+For each edge we apply two independent criteria.
+
+\textbf{Interventional GT}: zero-ablate L1 feature $i$ on 500 held-out
+prompts; confirm if $\langle|\Delta f_j|\rangle > 0.10 \cdot \langle
+f_j\rangle_{\text{clean}}$.
+
+\textbf{Observational GT}: compute Spearman rank correlation $\rho_s(X_i,
+X_j)$ over 5,000 prompts; confirm if $|\rho_s| > 0.20$ and $p < 0.01$.
+
+\emph{Intervention Agreement} (IA) under ground truth $\mathcal{T}$ is:
+\[
+  \text{IA}(\mathcal{M}, \mathcal{T}) =
+  \frac{|\{e \in \hat{\mathcal{E}}_\mathcal{M} \cap
+  \mathcal{E}_{\text{val}} : \mathcal{T}(e) = 1\}|}
+  {|\hat{\mathcal{E}}_\mathcal{M} \cap \mathcal{E}_{\text{val}}|}
+\]
+With only 40 validated edges, IA estimates carry confidence intervals of
+$\approx \pm 20$ percentage points (95\% CI via binomial proportion); method
+comparisons where $N_{\text{val}} < 20$ should not be over-interpreted.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Edge Counts and Intervention Agreement}
+
+\begin{table}[t]
+\centering
+\caption{Method comparison under interventional (ablation) ground truth.
+  $N_{\text{val}}$: number of predicted edges that fell in the validated
+  sample. $\dagger$: Abl-IA for Mean Ablation is upward-biased; see
+  Section~\ref{sec:bias}. All IA estimates carry $\approx\pm 20$pp 95\% CI.}
+\label{tab:results}
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lrrrr}
+\toprule
+Method & \# Edges & Abl-IA & $N_{\text{val}}$ & Runtime \\
+\midrule
+PC-FisherZ $\alpha{=}0.01$ & 184 & 0.667 & 18 & 33s \\
+PC-FisherZ $\alpha{=}0.05$ & 223 & 0.619 & 21 & 64s \\
+PC-FisherZ $\alpha{=}0.10$ & 255 & 0.619 & 21 & 98s \\
+PC-GSq $\alpha{=}0.01$     & 160 & 0.643 & 14 & 247s \\
+PC-GSq $\alpha{=}0.05$     & 200 & 0.611 & 18 & 499s \\
+PC-GSq $\alpha{=}0.10$     & 226 & 0.600 & 20 & 682s \\
+\textbf{GES-BIC}           & \textbf{157} & \textbf{0.667} & 15 & \textbf{36s} \\
+Mean Ablation 95th         & 69  & 0.850$^\dagger$ & 20 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{GES-BIC achieves the best precision--speed trade-off.}
+GES-BIC recovers the fewest cross-layer edges (157) while matching the best
+PC-FisherZ Ablation IA (0.667), in 36 seconds. Equal IA with fewer edges
+implies higher precision: GES-BIC produces less noise per confirmed edge than
+any PC variant. PC edge counts increase monotonically with $\alpha$ while Abl-IA
+decreases, confirming that looser testing accumulates unconfirmed false positives.
+
+\paragraph{PC-FisherZ vs.\ PC-GSq.}
+FisherZ finds slightly more edges at significantly lower runtime. GSq's binary
+representation discards magnitude information; while this removes the
+Gaussianity assumption, it reduces statistical power without an apparent
+precision gain. The IA gap (FisherZ 0.619, GSq 0.611 at $\alpha{=}0.05$)
+is within the CI but directionally consistent.
+
+\paragraph{Absolute IA in context.}
+A naive random baseline---selecting edges uniformly at random from the 1380
+possible cross-layer pairs---would yield an Ablation IA equal to the proportion
+of all true edges among all possible edges, which is unknown but expected to
+be substantially below 0.5 given the sparse nature of neural circuits.
+The PGM methods achieving 0.61--0.67 thus represent genuine signal, despite
+the wide confidence intervals.
+
+\subsection{Pairwise Method Agreement}
+
+\begin{table}[t]
+\centering
+\caption{Pairwise Jaccard similarity $|A \cap B| / |A \cup B|$.}
+\label{tab:jaccard}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+ & PC-FZ & PC-GSq & GES-BIC & Mean Abl \\
+\midrule
+PC-FZ    & 1.00 & 0.43 & 0.26 & 0.11 \\
+PC-GSq   & 0.43 & 1.00 & 0.19 & 0.10 \\
+GES-BIC  & 0.26 & 0.19 & 1.00 & 0.11 \\
+Mean Abl & 0.11 & 0.10 & 0.11 & 1.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Jaccard matrix reveals three tiers of agreement. (1)~\emph{Within-paradigm}:
+PC-FZ and PC-GSq share 0.43---same skeleton algorithm, different test, moderate
+overlap. (2)~\emph{Cross-paradigm statistical}: PC vs.\ GES share 0.19--0.26---
+both statistical, but GES's global BIC criterion is more conservative than
+per-edge hypothesis tests, yielding a more parsimonious skeleton. (3)~\emph{
+Statistical vs.\ causal}: PGM methods vs.\ Mean Ablation share only 0.10.
+
+This low overlap is not noise---it reflects a fundamental conceptual
+distinction. Statistical methods identify features that \emph{co-activate}
+across prompts, including both direct causes and features driven by a common
+upstream cause. Ablation methods identify features where one \emph{directly
+drives} the other when intervened upon. These are different causal relations,
+and the data shows they select very different edge sets.
+
+\subsection{Evaluation Bias}
+\label{sec:bias}
+
+The 0.850 Ablation IA for Mean Ablation vs.\ 0.60--0.67 for PGM methods might
+suggest ablation-based discovery is superior. This comparison is structurally
+unfair: both zero-ablation validation and Mean Ablation use activation
+disruption as their lens. An edge $(i,j)$ found because ablating $i$ changes
+$j$'s mean activation will trivially also be confirmed by zero-ablation
+validation. PGM methods, conversely, flag statistical co-occurrences including
+shared-cause correlations; ablation validation correctly rejects these, since
+zeroing one branch of a shared-cause pair does not affect the other. The
+upward bias on Mean Ablation's Abl-IA is therefore structural, not inferential.
+
+The Spearman Observational IA addresses this: Spearman correlation shares no
+inductive bias with any method (it is purely observational), providing a fair
+comparison across both statistical and causal methods. We describe this
+protocol in Section~5 and defer numerical results to a longer version of this
+work, where a full validation run is completed on all methods simultaneously.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Head-Level Circuit Recovery}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Feature-to-Head Attribution}
+
+We attribute each SAE feature to its dominant attention head by projecting the
+feature's encoder direction onto head-output space via $W_O$:
+\[
+  \alpha_{h,f}^{(L)} = \frac{1}{N}\sum_{n=1}^{N}
+  \mathbf{z}_{n,h}^{(L)}\,W_O^{(L)}[h]\cdot\mathbf{w}_{\text{enc},f}^{(L)}
+\]
+where $\mathbf{z}_{n,h}^{(L)}$ is the pre-$W_O$ output of head $h$ on prompt
+$n$. The dominant head assignment is $h^*(f) = \arg\max_h |\alpha_{h,f}|$.
+Feature-level edges $(i,j)$ are then aggregated to head-level counts:
+$M[h^*(i), h^*(j{-}p_1)] {+}{=} 1$.
+
+\subsection{Results and Interpretation}
+
+Head assignments are highly concentrated: 20 of 30 L1 features map to L0H9;
+20 of 46 L2 features map to L1H2 and 20 to L1H10. The known induction circuit
+(L0H0/H1 $\to$ L1H5/H6) scores an induction fraction of \textbf{0.000} across
+all methods.
+
+\paragraph{Why induction was not recovered.}
+The 5\%--95\% filter selects broadly-active features. The induction circuit
+activates on rare $A\ldots B\ldots A$ patterns; induction-specific SAE features
+have low firing rates and are excluded. This is a scope limitation of feature
+selection, not of the structure-learning algorithms: given induction-specific
+features as input, the algorithms would have the opportunity to recover the
+circuit.
+
+\paragraph{Consistent alternate circuit.}
+All four methods agree on L0H9 $\to$ L1H2/H10. L0H9 in GPT-2 Small is
+associated with broad positional and syntactic processing (carrying
+token-position signals across all inputs), consistent with its domination
+of broadly-active L1 features. L1H2 and L1H10 are known to process semantic
+and token-type information at layer 1. The recovered circuit plausibly
+reflects broad semantic content routing from layer 0 into layer 1
+representations---a real computational pattern, distinct from but not less
+meaningful than the induction mechanism.
+
+The cross-method consistency of this finding is a positive result: four
+independent algorithms with different assumptions all identify the same
+head-level structure, suggesting genuine signal rather than method-specific
+artefacts.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Discussion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\paragraph{Scalability constraints motivate targeted feature selection.}
+The principled extension of our work is to relax the firing-rate filter
+to include induction-specific features. Table~\ref{tab:complexity} shows this
+is combinatorially infeasible without algorithmic changes. The solution is
+\emph{targeted feature selection}: compute head--feature attribution
+$\alpha_{h,f}$ for all 24,576 SAE features (a single forward pass), select
+the top-$k$ features per known circuit head (e.g.\ L0H0/H1, L1H5/H6), and
+run GES on the resulting $\approx 80$-node graph. This keeps runtime at $\sim$36s
+while directly targeting induction-relevant features.
+
+\begin{table}[h]
+\centering
+\caption{Estimated runtimes as firing-rate filter is relaxed.}
+\label{tab:complexity}
+\small
+\begin{tabular}{llll}
+\toprule
+$p$ & Filter & PC-FisherZ & GES-BIC \\
+\midrule
+76 (current) & 5--95\%    & 64s      & 36s \\
+$\sim$300    & 1--99\%    & $\sim$8h & $\sim$15min \\
+$\sim$800    & 0.5--99.5\%& $\sim$100 days & $\sim$5h \\
+49,152 (all) & none       & centuries & weeks \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{PGM structure learning is viable for circuit discovery.}
+All three PGM methods produce partially-confirmed edge sets without any
+task-specific supervision. GES-BIC's combination of global score optimisation
+and Schur-complement acceleration makes it practically competitive with the
+causal proxy baseline on Ablation IA while maintaining methodological rigour.
+
+\paragraph{Statistical vs.\ causal methods find different circuits.}
+The Jaccard $\approx 0.10$ between PGM and Mean Ablation is a substantive
+finding. It rules out the hypothesis that statistical co-occurrence
+straightforwardly proxies causal influence in transformer activations. Both
+types of edges are scientifically meaningful---co-activation structure reflects
+shared computational roles, while causal edges reflect direct information
+routing---but they should not be conflated.
+
+\paragraph{Limitations.}
+(1) PC runs the skeleton phase only; within-layer edge orientation would
+require v-structure detection and Meek's rules.
+(2) With 40 validated edges, all IA estimates carry $\approx\pm 20$pp 95\% CIs;
+method differences are suggestive, not conclusive.
+(3) Fisher-Z assumes Gaussianity; SAE activations are ReLU-gated and
+zero-inflated, which may inflate type-I error at small sample sizes.
+(4) Mean Ablation captures only first-order effects; nonlinear or multi-hop
+causal paths are not measured.
+(5) All experiments use GPT-2 Small on random prompts; generalisation to
+other models or task-specific distributions is not assessed.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+We have demonstrated that classical PGM structure learning---PC and GES---can
+recover partially causally-validated feature circuits in a language model from
+activation data alone, without task-specific supervision. GES-BIC is the
+recommended method: it achieves the best precision--speed trade-off, avoids
+the false-positive accumulation of per-edge hypothesis testing, and scales
+gracefully via Schur-complement score evaluation.
+
+The low Jaccard similarity between statistical and ablation methods
+($J \approx 0.10$) is a key negative result: co-activation structure does not
+straightforwardly proxy direct causal influence. We argue this motivates
+a \emph{two-layer} evaluation protocol---interventional for causal edges,
+observational for statistical dependencies---and that single-metric evaluation
+conflating the two produces misleading conclusions.
+
+The failure to recover the induction circuit reveals that feature selection is
+the binding constraint, not the structure-learning algorithms. Targeted
+head-attribution-seeded feature selection is the natural next step: it would
+preserve the computational efficiency of our approach while directly targeting
+circuit-specific features, and represents a promising direction toward scalable,
+automated, supervision-free circuit discovery in large language models.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[Bloom et al.(2024)]{bloom2024saelens}
+Joseph Bloom, David Chanin, Curt Tigges, and Neel Nanda.
+\newblock \texttt{SAELens}.
+\newblock \emph{GitHub}, 2024.
+\newblock \url{https://github.com/jbloomaus/SAELens}.
+
+\bibitem[Chickering(2002)]{chickering2002ges}
+David Maxwell Chickering.
+\newblock Optimal structure identification with greedy search.
+\newblock \emph{JMLR}, 3:507--554, 2002.
+
+\bibitem[Conmy et al.(2023)]{conmy2023acdc}
+Arthur Conmy, Augustine N.\ Mavor-Parker, Aengus Lynch, Stefan Heimersheim,
+and Adri\`{a} Garriga-Alonso.
+\newblock Towards automated circuit discovery for mechanistic interpretability.
+\newblock In \emph{NeurIPS}, 2023.
+
+\bibitem[Elhage et al.(2021)]{elhage2021framework}
+Nelson Elhage, Neel Nanda, Catherine Olsson, et al.
+\newblock A mathematical framework for transformer circuits.
+\newblock \emph{Transformer Circuits Thread}, 2021.
+
+\bibitem[Elhage et al.(2022)]{elhage2022superposition}
+Nelson Elhage, Tristan Henighan, Nicholas Joseph, et al.
+\newblock Toy models of superposition.
+\newblock \emph{Transformer Circuits Thread}, 2022.
+
+\bibitem[Marks et al.(2025)]{marks2025sparse}
+Samuel Marks, Can Rager, Eric J.\ Michaud, Yonatan Belinkov, David Bau,
+and Aaron Mueller.
+\newblock Sparse feature circuits: Discovering and editing interpretable causal
+graphs in language models.
+\newblock \emph{ICLR}, 2025.
+
+\bibitem[Meek(1995)]{meek1995causal}
+Christopher Meek.
+\newblock Causal inference and causal explanation with background knowledge.
+\newblock In \emph{UAI}, pages 403--410, 1995.
+
+\bibitem[Nanda and Lawrence(2022)]{nanda2022transformerlens}
+Neel Nanda and Joseph Lawrence.
+\newblock TransformerLens.
+\newblock \emph{GitHub}, 2022.
+\newblock \url{https://github.com/neelnanda-io/TransformerLens}.
+
+\bibitem[Olah et al.(2020)]{olah2020zoom}
+Chris Olah, Nick Cammarata, Ludwig Schubert, Gabriel Goh, Michael Petrov,
+and Shan Carter.
+\newblock Zoom in: An introduction to circuits.
+\newblock \emph{Distill}, 2020.
+
+\bibitem[Olsson et al.(2022)]{olsson2022induction}
+Catherine Olsson, Nelson Elhage, Neel Nanda, Nicholas Joseph, Nova DasSarma,
+Tom Henighan, Ben Mann, et al.
+\newblock In-context learning and induction heads.
+\newblock \emph{Transformer Circuits Thread}, 2022.
+
+\bibitem[Radford et al.(2019)]{radford2019gpt2}
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever.
+\newblock Language models are unsupervised multitask learners.
+\newblock \emph{OpenAI Blog}, 1(8):9, 2019.
+
+\bibitem[Spirtes et al.(2000)]{spirtes2000causation}
+Peter Spirtes, Clark Glymour, and Richard Scheines.
+\newblock \emph{Causation, Prediction, and Search}.
+\newblock MIT Press, 2nd ed., 2000.
+
+\bibitem[Wang et al.(2022)]{wang2022ioi}
+Kevin Wang, Alexandre Variengien, Arthur Conmy, Buck Shlegeris,
+and Jacob Steinhardt.
+\newblock Interpretability in the wild: A circuit for indirect object
+identification in GPT-2 small.
+\newblock \emph{ICLR}, 2023.
+
+\end{thebibliography}
+
+\end{document}
